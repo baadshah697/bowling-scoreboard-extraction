@@ -850,6 +850,16 @@ if ui_state == "EMPTY":
 
     if uploaded_file is not None:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Clean old debug keyframes from previous videos
+        k_dir = os.path.join(OUTPUT_DIR, "debug", "keyframes")
+        if os.path.exists(k_dir):
+            import shutil
+            try:
+                shutil.rmtree(k_dir)
+            except Exception:
+                pass
+        os.makedirs(k_dir, exist_ok=True)
+
         saved_path = os.path.join(OUTPUT_DIR, "_uploaded_video.mp4")
         with open(saved_path, "wb") as f:
             f.write(uploaded_file.read())
@@ -857,6 +867,7 @@ if ui_state == "EMPTY":
         st.session_state["uploaded_video_path"] = saved_path
         st.session_state["uploaded_video_name"] = uploaded_file.name
         st.session_state["uploaded_video_size"] = len(uploaded_file.getvalue())
+        st.session_state["selected_inspector_idx"] = None
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -915,6 +926,7 @@ elif ui_state == "READY":
             st.session_state["progress_pct"]     = 0.0
             st.session_state["current_frame"]    = 0
             st.session_state["total_frames"]     = 0
+            st.session_state["selected_inspector_idx"] = None
 
             # Launch pipeline background worker with thread-safe queue
             t = threading.Thread(
@@ -934,12 +946,22 @@ elif ui_state == "READY":
             key="replace_uploader",
         )
         if new_file is not None:
+            k_dir = os.path.join(OUTPUT_DIR, "debug", "keyframes")
+            if os.path.exists(k_dir):
+                import shutil
+                try:
+                    shutil.rmtree(k_dir)
+                except Exception:
+                    pass
+            os.makedirs(k_dir, exist_ok=True)
+
             saved_path = os.path.join(OUTPUT_DIR, "_uploaded_video.mp4")
             with open(saved_path, "wb") as f:
                 f.write(new_file.read())
             st.session_state["uploaded_video_path"] = saved_path
             st.session_state["uploaded_video_name"] = new_file.name
             st.session_state["uploaded_video_size"] = len(new_file.getvalue())
+            st.session_state["selected_inspector_idx"] = None
             st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════

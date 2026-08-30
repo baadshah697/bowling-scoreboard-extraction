@@ -108,15 +108,15 @@ def run_pipeline(video_path: str, output_dir: str = None):
         emit({"type": "error", "message": f"Input video not found: {video_path}"})
         return
 
-    cache_path = os.path.join(output_dir, "debug", "scene_gate_results.json")
-    is_scoreboard_cache: dict = {}
-    if os.path.exists(cache_path):
+    # Ensure clean keyframe and preview directory for the new video
+    keyframe_dir = os.path.join(output_dir, "debug", "keyframes")
+    if os.path.exists(keyframe_dir):
+        import shutil
         try:
-            with open(cache_path) as f:
-                for item in json.load(f):
-                    is_scoreboard_cache[item["frame_idx"]] = (item["classification"] == "SCOREBOARD")
+            shutil.rmtree(keyframe_dir)
         except Exception:
             pass
+    os.makedirs(keyframe_dir, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -157,37 +157,30 @@ def run_pipeline(video_path: str, output_dir: str = None):
         ts = frame_idx / fps
 
         # ── 1. Scene Gate ────────────────────────────────────────────────────
-        if frame_idx in is_scoreboard_cache:
-            is_sb = is_scoreboard_cache[frame_idx]
-            scene_label = "SCOREBOARD" if is_sb else "CUTAWAY"
-        else:
-            diff = compute_frame_diff(prev_frame, frame) if prev_frame is not None else 0.0
-            blue_cov = compute_blue_coverage(frame)
-            edge_dens = compute_structural_edge_density(frame)
-            scene_label = classify_frame(diff, blue_cov, edge_dens)
-            is_sb = (scene_label == "SCOREBOARD")
+        diff = compute_frame_diff(prev_frame, frame) if prev_frame is not None else 0.0
+        blue_cov = compute_blue_coverage(frame)
+        edge_dens = compute_structural_edge_density(frame)
+        scene_label = classify_frame(diff, blue_cov, edge_dens)
+        is_sb = (scene_label == "SCOREBOARD")
 
         active_row, _ = _detect_active_row(frame) if is_sb else (None, 0)
 
-        # Stage classification for data-driven checklist
-        stage_name = "Scene Detection (3-Signal Gate)" if not is_sb else "Cell Segmentation & Quality Gate"
-
-        emit({
-            "type": "progress",
-            "frame": frame_idx,
-            "total": total_frames,
-            "ts": round(ts, 2),
-            "scene": scene_label,
-            "active_row": active_row,
-            "stage": stage_name,
-        })
-
         if not is_sb:
             cutaway_seen += 1
+            cut_v_frame = frame.copy()
+            cut_v_frame = _draw_cutaway_gate(cut_v_frame)
             if video_writer is not None:
-                cut_v_frame = frame.copy()
-                cut_v_frame = _draw_cutaway_gate(cut_v_frame)
                 video_writer.write(cut_v_frame)
+            
+            # Save keyframe image for timeline explorer
+            try:
+                cv2.imwrite(os.path.join(keyframe_dir, f"frame_{frame_idx}.jpg"), cut_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            except Exception:
+                pass
+            
+            # Carry over committed state in timeline
+            current_state = tracker.committed
+            state_timeline[str(frame_idx)] = check_rules(current_state)["annotated_state"]
             prev_frame = None
             frame_idx += 1
             continue
@@ -211,21 +204,14 @@ def run_pipeline(video_path: str, output_dir: str = None):
 
         # ── 3. Unlabeled Metric ─────────────────────────────────────────────
         if unlabeled_metric is None:
-            unlabeled_metric = _read_unlabeled_metric(frame)
+            metric_val = _read_unlabeled_metric(frame)
+            if metric_val:
+                unlabeled_metric = metric_val
 
-        # ── 4. Quality Gate & OCR ───────────────────────────────────────────
+        # ── 4. Cell Quality Gate & OCR ──────────────────────────────────────
         valid_cells = apply_quality_gates(frame, prev_frame)
         prev_frame = frame.copy()
-        cells_clear = sum(
-            1 for r in valid_cells.values()
-            for sub in r.values()
-            for c in sub
-            if c is not None and not c["occluded"]
-        )
-        if cells_clear == 0:
-            frame_idx += 1
-            continue
-
+        
         emit({
             "type": "progress",
             "frame": frame_idx,
@@ -243,23 +229,17 @@ def run_pipeline(video_path: str, output_dir: str = None):
         state_with_rules = check_rules(state)["annotated_state"]
         state_timeline[str(frame_idx)] = state_with_rules
 
-        # Save live preview frame and keyframes for frame-wise inspection
-        try:
-            preview_img = frame.copy()
-            if active_row and active_row in config.ROW_BANDS:
-                y1, y2 = config.ROW_BANDS[active_row]
-                cv2.rectangle(preview_img, (config.COL_X_BOUNDS[0], y1), (config.COL_X_BOUNDS[-1], y2), (0, 215, 255), 3)
-            cv2.putText(preview_img, f"ScoreVision Live Extraction | Frame #{frame_idx} | t={ts:.1f}s | Active: Row {active_row or '-'}",
-                        (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2, cv2.LINE_AA)
-            
-            # Live preview image
-            preview_save_p = os.path.join(output_dir, "debug", "live_preview.jpg")
-            cv2.imwrite(preview_save_p, preview_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Build fully annotated frame
+        ann_v_frame = frame.copy()
+        ann_v_frame = _draw_grid(ann_v_frame)
+        ann_v_frame = _draw_state(ann_v_frame, state_with_rules)
+        ann_v_frame = _draw_scoreboard_gate(ann_v_frame)
 
-            # Persistent keyframe image for post-run timeline explorer
-            keyframe_dir = os.path.join(output_dir, "debug", "keyframes")
-            os.makedirs(keyframe_dir, exist_ok=True)
-            cv2.imwrite(os.path.join(keyframe_dir, f"frame_{frame_idx}.jpg"), preview_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        # Save keyframe image for live preview and timeline explorer
+        try:
+            preview_save_p = os.path.join(output_dir, "debug", "live_preview.jpg")
+            cv2.imwrite(preview_save_p, ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            cv2.imwrite(os.path.join(keyframe_dir, f"frame_{frame_idx}.jpg"), ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         except Exception:
             pass
 

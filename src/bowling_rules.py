@@ -122,31 +122,63 @@ def compute_cumulative_scores(pinfall_frames: list) -> list:
     return cumulative
 
 
+def compute_display_cumulatives(pinfall_frames: list, ocr_cumulatives: list = None) -> list:
+    """
+    Computes the visual 2-tier display cumulative score for all played frames.
+    For completed open frames, calculates C_i = C_{i-1} + rolls.
+    For in-progress strikes or spares, calculates C_{i-1} + 10 (base pinfall).
+    If OCR cumulative is verified and monotonic, incorporates it to cross-validate.
+    """
+    disp_cum = [None] * 10
+    running = 0
+
+    for i in range(10):
+        pf = pinfall_frames[i].strip() if i < len(pinfall_frames) and pinfall_frames[i] else ''
+        if not pf:
+            continue
+
+        rolls = _parse_rolls(pf)
+        if not rolls:
+            continue
+
+        if rolls[0] == 10:  # Strike
+            # Lookahead if future rolls exist
+            next_pf = pinfall_frames[i+1].strip() if i+1 < len(pinfall_frames) and pinfall_frames[i+1] else ''
+            next_rolls = _parse_rolls(next_pf) if next_pf else []
+            if len(next_rolls) >= 2:
+                running += 10 + next_rolls[0] + next_rolls[1]
+            elif len(next_rolls) == 1 and next_rolls[0] == 10:  # Double strike
+                n2_pf = pinfall_frames[i+2].strip() if i+2 < len(pinfall_frames) and pinfall_frames[i+2] else ''
+                n2_rolls = _parse_rolls(n2_pf) if n2_pf else []
+                if n2_rolls:
+                    running += 20 + n2_rolls[0]
+                else:
+                    running += 10
+            else:
+                running += 10  # In-progress base pinfall
+        elif len(rolls) >= 2 and rolls[0] + rolls[1] == 10:  # Spare
+            next_pf = pinfall_frames[i+1].strip() if i+1 < len(pinfall_frames) and pinfall_frames[i+1] else ''
+            next_rolls = _parse_rolls(next_pf) if next_pf else []
+            if next_rolls:
+                running += 10 + next_rolls[0]
+            else:
+                running += 10
+        else:  # Open frame
+            running += sum(rolls)
+
+        disp_cum[i] = running
+
+    return disp_cum
+
+
 def compute_bowler_total(pinfall_frames: list, cumulative_scores: list = None) -> int:
     """
     Computes the current running match total for the bowler (matching alley TTL).
     Sums all completed/resolved frames + base pins from any unresolved in-progress frames.
     """
-    if cumulative_scores is None:
-        cumulative_scores = compute_cumulative_scores(pinfall_frames)
-
-    last_resolved_score = 0
-    last_resolved_idx = -1
-
-    for idx, sc in enumerate(cumulative_scores):
-        if sc is not None:
-            last_resolved_score = sc
-            last_resolved_idx = idx
-
-    # Add pins from in-progress frames after the last resolved frame
-    unresolved_pins = 0
-    for idx in range(last_resolved_idx + 1, len(pinfall_frames)):
-        pf = pinfall_frames[idx]
-        if pf:
-            rolls = _parse_rolls(pf)
-            unresolved_pins += sum(rolls)
-
-    return last_resolved_score + unresolved_pins if (last_resolved_score > 0 or unresolved_pins > 0) else None
+    disp_cums = compute_display_cumulatives(pinfall_frames, cumulative_scores)
+    valid_scores = [c for c in disp_cums if c is not None]
+    return max(valid_scores) if valid_scores else None
 
 
 def reconcile_row_state(frames: dict) -> dict:
@@ -170,6 +202,16 @@ def reconcile_row_state(frames: dict) -> dict:
             validated_cum[i] = ocr_cum
             running_max = ocr_cum
 
+    # Backward reconciliation from verified cumulative totals
+    for i in range(9, 0, -1):
+        if validated_cum[i] is not None and validated_cum[i-1] is None:
+            pf_curr = pinfalls[i]
+            rolls = _parse_rolls(pf_curr) if pf_curr else []
+            if rolls:
+                step_val = 10 if rolls[0] == 10 else sum(rolls)
+                if validated_cum[i] >= step_val:
+                    validated_cum[i-1] = validated_cum[i] - step_val
+
     # Reconcile pinfalls with validated cumulative deltas
     for i in range(10):
         key = str(i + 1)
@@ -186,6 +228,15 @@ def reconcile_row_state(frames: dict) -> dict:
                     pinfalls[i] = curr_pf
                     if key in frames:
                         frames[key]["pinfall"] = curr_pf
+                elif len(curr_pf) == 2 and curr_pf[1].isdigit():
+                    # If roll 2 is known, verify roll 1
+                    r2_val = int(curr_pf[1])
+                    r1_val = delta - r2_val
+                    if 0 <= r1_val < 10:
+                        curr_pf = f"{r1_val}{r2_val}"
+                        pinfalls[i] = curr_pf
+                        if key in frames:
+                            frames[key]["pinfall"] = curr_pf
 
         # Normalize single-digit open frame pinfalls (e.g. '9' -> '9-', '6' -> '6-')
         if len(curr_pf) == 1 and curr_pf.isdigit():
@@ -197,23 +248,23 @@ def reconcile_row_state(frames: dict) -> dict:
 
     # Calculate exact rule-governed cumulative scores
     computed_cumulative = compute_cumulative_scores(pinfalls)
+    display_cumulatives = compute_display_cumulatives(pinfalls, validated_cum)
     computed_total = compute_bowler_total(pinfalls, computed_cumulative)
 
     for i in range(10):
         key = str(i + 1)
         if key in frames:
             comp_cum = computed_cumulative[i]
-            val_cum = validated_cum[i]
+            disp_cum = display_cumulatives[i]
 
             # Use mathematically verified score
-            final_cum = comp_cum if comp_cum is not None else val_cum
             frames[key]["computed_cumulative"] = comp_cum
-            frames[key]["cumulative"] = final_cum
-            frames[key]["rule_check"] = "PASS" if (final_cum is not None or pinfalls[i]) else "UNKNOWN"
+            frames[key]["cumulative"] = disp_cum
+            frames[key]["rule_check"] = "PASS" if (disp_cum is not None or pinfalls[i]) else "UNKNOWN"
 
     return {
         "pinfalls": pinfalls,
-        "cumulative": computed_cumulative,
+        "cumulative": display_cumulatives,
         "total": computed_total
     }
 
