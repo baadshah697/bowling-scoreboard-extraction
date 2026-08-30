@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches and virtual environments
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
+env/
+ENV/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Large Video Files (>100MB)
+data/*.mp4
+data/*.mov
+data/*.avi
+data/*.mkv
+
+# Runtime Outputs and Debug Caches
+output/*.mp4
+output/*.json
+output/*.csv
+output/*.xlsx
+output/*.zip
+output/debug/
+output/baseline_before_fix/
+
+# Keep directory structure
+!data/.gitkeep
+!output/.gitkeep
+
+# Temporary notes
+scratch_brief*.txt
+.env
