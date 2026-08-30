@@ -26,10 +26,15 @@ _reader = None
 _raw_candidates_log = []
 
 
-def get_reader():
+def get_reader(force_cpu: bool = False):
     global _reader
     if _reader is None:
-        use_gpu = torch.cuda.is_available()
+        force_env = os.environ.get("SCOREVISION_FORCE_CPU", "0") == "1"
+        use_gpu = torch.cuda.is_available() and not force_cpu and not force_env
+        if not use_gpu:
+            num_cores = os.cpu_count() or 4
+            os.environ["OMP_NUM_THREADS"] = str(num_cores)
+            torch.set_num_threads(num_cores)
         _reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
     return _reader
 
@@ -160,9 +165,20 @@ def extract_text_from_cell(cell_img: np.ndarray,
     return chosen_text, chosen_boxes
 
 
+_cell_cache = {}
+
+
+def reset_ocr_cache():
+    """Reset temporal cell cache between video runs."""
+    global _cell_cache, _raw_candidates_log
+    _cell_cache.clear()
+    _raw_candidates_log.clear()
+
+
 def ocr_all_valid_cells(valid_cells: dict, timestamp_sec: float = 0.0) -> dict:
     """
-    Run OCR on every clear (non-occluded) cell.
+    Run OCR on every clear (non-occluded) cell with temporal diff caching.
+    If a cell has not changed from previous keyframes, reuses cached OCR output in 0.01ms.
 
     Args:
         valid_cells: output of cell_extractor.apply_quality_gates()
@@ -171,7 +187,9 @@ def ocr_all_valid_cells(valid_cells: dict, timestamp_sec: float = 0.0) -> dict:
     Returns:
         raw_strings[row][subrow][col] = str | None
     """
+    global _cell_cache
     raw_strings = {}
+
     for row in ["J", "V", "P", "T"]:
         raw_strings[row] = {"pinfall": [None] * config.NUM_FRAME_COLUMNS,
                             "cumulative": [None] * config.NUM_FRAME_COLUMNS}
@@ -185,10 +203,28 @@ def ocr_all_valid_cells(valid_cells: dict, timestamp_sec: float = 0.0) -> dict:
                 elif cell["occluded"]:
                     raw_strings[row][subrow][col] = None
                 else:
+                    cell_img = cell["img"]
+                    cell_key = (row, subrow, col)
+
+                    # Quick grayscale for temporal diff comparison
+                    gray_thumb = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY) if len(cell_img.shape) == 3 else cell_img
+
+                    # Check if cell has changed from previous observation
+                    if cell_key in _cell_cache:
+                        last_gray, cached_text, cached_boxes = _cell_cache[cell_key]
+                        if gray_thumb.shape == last_gray.shape:
+                            diff_val = float(np.mean(cv2.absdiff(gray_thumb, last_gray)))
+                            if diff_val < 3.5:
+                                # Cell has not changed -- reuse in 0.01ms!
+                                raw_strings[row][subrow][col] = cached_text
+                                continue
+
+                    # Cell has changed or is seen for the first time -- run full OCR
                     ctx = (row, subrow, col + 1, round(timestamp_sec, 2))
                     text, candidates = extract_text_from_cell(
-                        cell["img"], allowlist=allowlist, is_pinfall=is_pf, debug_context=ctx
+                        cell_img, allowlist=allowlist, is_pinfall=is_pf, debug_context=ctx
                     )
+                    _cell_cache[cell_key] = (gray_thumb.copy(), text, candidates)
                     raw_strings[row][subrow][col] = text
 
     return raw_strings

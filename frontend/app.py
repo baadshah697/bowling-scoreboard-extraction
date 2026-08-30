@@ -79,6 +79,10 @@ SESSION_DEFAULTS = {
     "scene_class":         "—",
     "active_row":          None,
     "active_stage":        "Idle",
+    # Hardware detection
+    "hw_mode":             "Auto-Detecting...",
+    "hw_label":            "Detecting hardware...",
+    "hw_detail":           "",
     # Live scoreboard state (§3 schema)
     "live_state":          None,
     "final_state":         None,
@@ -105,6 +109,17 @@ while not q.empty():
     if evt_type == "started":
         st.session_state["total_frames"] = evt.get("total", 0)
         st.session_state["active_stage"] = "Pipeline Started"
+        # Carry over hardware label from started event if present
+        if evt.get("hw_mode"):
+            st.session_state["hw_mode"]  = evt.get("hw_mode", "—")
+            st.session_state["hw_label"] = evt.get("hw_label", "—")
+
+    elif evt_type == "hardware":
+        st.session_state["hw_mode"]   = evt.get("mode", "—")
+        st.session_state["hw_label"]  = evt.get("label", "—")
+        st.session_state["hw_detail"] = evt.get("detail", "")
+        hw_log = f"[ScoreVision] ⚡ Hardware: {evt.get('label')} | {evt.get('detail')}"
+        st.session_state["log_lines"].append(hw_log)
 
     elif evt_type == "progress":
         frame = evt.get("frame", 0)
@@ -115,6 +130,8 @@ while not q.empty():
         st.session_state["active_row"]    = evt.get("active_row")
         st.session_state["active_stage"]  = evt.get("stage", st.session_state["active_stage"])
         st.session_state["progress_pct"]  = min(100.0, (frame / total) * 100 if total > 0 else 0)
+        if evt.get("hw_mode") and st.session_state["hw_mode"] == "Auto-Detecting...":
+            st.session_state["hw_mode"] = evt.get("hw_mode")
 
     elif evt_type == "state":
         st.session_state["live_state"]   = evt.get("state")
@@ -127,6 +144,9 @@ while not q.empty():
         st.session_state["pipeline_running"] = False
         st.session_state["pipeline_done"]    = True
         st.session_state["active_stage"]     = "Completed"
+        if evt.get("hw_mode"):
+            st.session_state["hw_mode"]  = evt.get("hw_mode", st.session_state["hw_mode"])
+            st.session_state["hw_label"] = evt.get("hw_label", st.session_state["hw_label"])
 
     elif evt_type == "error":
         st.session_state["pipeline_error"]   = evt.get("message")
@@ -1027,8 +1047,16 @@ elif ui_state == "RUNNING":
         """, unsafe_allow_html=True)
 
         live_preview_p = os.path.join(OUTPUT_DIR, "debug", "live_preview.jpg")
-        if os.path.exists(live_preview_p):
-            st.image(live_preview_p, use_container_width=True)
+        if os.path.exists(live_preview_p) and os.path.getsize(live_preview_p) > 1024:
+            try:
+                st.image(
+                    live_preview_p,
+                    caption=f"⚡ Live Processing Frame #{st.session_state['current_frame']} (t={st.session_state['current_ts']:.1f}s)",
+                    use_container_width=True
+                )
+            except Exception:
+                if st.session_state["uploaded_video_path"] and os.path.exists(st.session_state["uploaded_video_path"]):
+                    st.video(st.session_state["uploaded_video_path"])
         elif st.session_state["uploaded_video_path"] and os.path.exists(st.session_state["uploaded_video_path"]):
             st.video(st.session_state["uploaded_video_path"])
 
@@ -1047,8 +1075,19 @@ elif ui_state == "RUNNING":
         v_name = st.session_state["uploaded_video_name"] or "video.mp4"
         v_size_mb = st.session_state["uploaded_video_size"] / (1024 * 1024)
 
+        hw_mode  = st.session_state.get("hw_mode", "—")
+        hw_label = st.session_state.get("hw_label", "—")
+        hw_detail = st.session_state.get("hw_detail", "")
+        hw_color  = "#22c55e" if hw_mode == "GPU" else "#38bdf8"
+        hw_icon   = "🟢" if hw_mode == "GPU" else "🔵"
+
         st.markdown(f"""
         <div style="background:#111c30;border:1px solid #1e2f4d;border-radius:10px;padding:16px;margin-top:8px;">
+          <div style="margin-bottom:12px;padding:10px 14px;background:rgba(34,197,94,0.08);border:1px solid {hw_color}40;border-radius:8px;">
+            <div style="font-size:11px;font-weight:700;color:{hw_color};letter-spacing:1px;text-transform:uppercase;margin-bottom:4px;">{hw_icon} Compute Hardware — Auto Detected</div>
+            <div style="font-size:13px;font-weight:700;color:#fff;">{hw_label}</div>
+            <div style="font-size:11px;color:#94a3b8;margin-top:2px;">{hw_detail}</div>
+          </div>
           <div style="margin-bottom:10px;font-size:13px;color:#94a3b8;">
             📁 <strong>Source:</strong> {v_name} ({v_size_mb:.1f} MB)
           </div>
@@ -1066,6 +1105,7 @@ elif ui_state == "RUNNING":
           </div>
         </div>
         """, unsafe_allow_html=True)
+
 
     # KPI Cards (Live)
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
@@ -1136,9 +1176,21 @@ elif ui_state == "RUNNING":
     """, unsafe_allow_html=True)
 
     # Collapsible Pipeline Log
-    with st.expander("📋 Pipeline Log Output"):
-        logs = st.session_state["log_lines"][-80:]
+    hw_mode_log  = st.session_state.get("hw_mode", "—")
+    hw_label_log = st.session_state.get("hw_label", "—")
+    hw_detail_log = st.session_state.get("hw_detail", "—")
+    with st.expander("📋 Pipeline Terminal Log", expanded=False):
+        hw_color_log = "#22c55e" if hw_mode_log == "GPU" else "#38bdf8"
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {hw_color_log}40;border-radius:8px;padding:12px;margin-bottom:10px;font-family:'JetBrains Mono',monospace;">
+          <div style="color:{hw_color_log};font-size:11px;font-weight:700;letter-spacing:1px;">⚡ COMPUTE HARDWARE — AUTO DETECTED</div>
+          <div style="color:#fff;font-size:13px;margin-top:4px;">{hw_label_log}</div>
+          <div style="color:#64748b;font-size:11px;margin-top:2px;">{hw_detail_log}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        logs = st.session_state["log_lines"][-100:]
         st.code("\n".join(logs) if logs else "Awaiting log output…", language=None)
+
 
     # Trigger Main-Thread Rerun while Running
     time.sleep(0.5)
@@ -1205,14 +1257,22 @@ elif ui_state == "DONE":
         st.markdown("""
         <div class="vpanel">
           <div class="vpanel-header">
-            <div class="vpanel-title">📹 Source Video</div>
-            <span class="vtag vtag-raw">SOURCE VIDEO</span>
+            <div class="vpanel-title">📹 Video Player (AI Annotated &amp; Source)</div>
+            <span class="vtag vtag-green">READY TO PLAY</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
 
-        if st.session_state["uploaded_video_path"] and os.path.exists(st.session_state["uploaded_video_path"]):
-            st.video(st.session_state["uploaded_video_path"])
+        vid_tab1, vid_tab2 = st.tabs(["🎬 AI-Annotated Video", "📹 Raw Source Video"])
+        ann_vid_p = os.path.join(OUTPUT_DIR, "annotated_video.mp4")
+        with vid_tab1:
+            if os.path.exists(ann_vid_p) and os.path.getsize(ann_vid_p) > 1024:
+                st.video(ann_vid_p)
+            elif st.session_state["uploaded_video_path"] and os.path.exists(st.session_state["uploaded_video_path"]):
+                st.video(st.session_state["uploaded_video_path"])
+        with vid_tab2:
+            if st.session_state["uploaded_video_path"] and os.path.exists(st.session_state["uploaded_video_path"]):
+                st.video(st.session_state["uploaded_video_path"])
 
     with vcol2:
         st.markdown("""
@@ -1406,7 +1466,7 @@ elif ui_state == "DONE":
                 🎳 <strong>Active Bowler:</strong> {act_b_name} (Row {act_b_row})
               </div>
               <div style="margin-bottom:8px;font-size:13px;color:#a855f7;">
-                ⚡ <strong>OCR Engine:</strong> EasyOCR (CRAFT + GPU CUDA)
+                ⚡ <strong>OCR Engine:</strong> {st.session_state.get("hw_label", "EasyOCR CRAFT")}
               </div>
               <div style="font-size:13px;color:#10b981;">
                 ✓ <strong>10-Pin Rule Verification:</strong> PASS (Reconciled)

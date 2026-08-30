@@ -21,6 +21,7 @@ import argparse
 from collections import Counter
 import cv2
 import numpy as np
+import torch
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Resolve paths relative to project root
@@ -91,6 +92,28 @@ def emit(obj):
     print(json.dumps(obj), flush=True)
 
 
+def _detect_hardware():
+    """
+    Auto-detect available compute hardware.
+    Returns (use_gpu: bool, device_label: str, detail: str)
+    """
+    force_env = os.environ.get("SCOREVISION_FORCE_CPU", "0") == "1"
+    gpu_available = torch.cuda.is_available() and not force_env
+    if gpu_available:
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+        except Exception:
+            gpu_name = "NVIDIA GPU"
+        num_cores = os.cpu_count() or 1
+        label = f"GPU (CUDA) — {gpu_name}"
+        detail = f"EasyOCR CRAFT running on {gpu_name} VRAM | {num_cores} CPU threads available"
+    else:
+        num_cores = os.cpu_count() or 4
+        label = f"CPU (Multi-Core SIMD) — {num_cores} Threads"
+        detail = f"EasyOCR CRAFT running on {num_cores} CPU threads with SIMD + Temporal Cell Cache"
+    return gpu_available, label, detail
+
+
 def run_pipeline(video_path: str, output_dir: str = None):
     if output_dir is None:
         output_dir = os.path.join(PROJECT_ROOT, "output")
@@ -107,6 +130,25 @@ def run_pipeline(video_path: str, output_dir: str = None):
     if not os.path.exists(video_path):
         emit({"type": "error", "message": f"Input video not found: {video_path}"})
         return
+
+    from ocr_engine import reset_ocr_cache
+    reset_ocr_cache()
+
+    # ── Hardware Auto-Detection ──────────────────────────────────────────────
+    use_gpu, hw_label, hw_detail = _detect_hardware()
+    hw_mode = "GPU" if use_gpu else "CPU"
+
+    # Print to terminal
+    print(f"[ScoreVision] Hardware Detected: {hw_label}", flush=True)
+    print(f"[ScoreVision] OCR Engine: {hw_detail}", flush=True)
+
+    # Emit event for dashboard
+    emit({
+        "type": "hardware",
+        "mode": hw_mode,
+        "label": hw_label,
+        "detail": hw_detail,
+    })
 
     # Ensure clean keyframe and preview directory for the new video
     keyframe_dir = os.path.join(output_dir, "debug", "keyframes")
@@ -142,7 +184,8 @@ def run_pipeline(video_path: str, output_dir: str = None):
     unlabeled_metric = None
     lane_number = None
 
-    emit({"type": "started", "total": total_frames, "fps": fps})
+    print(f"[ScoreVision] Processing video: {os.path.basename(video_path)} ({total_frames} frames @ {fps:.1f} fps)", flush=True)
+    emit({"type": "started", "total": total_frames, "fps": fps, "hw_mode": hw_mode, "hw_label": hw_label})
 
     frame_idx = 0
     while True:
@@ -220,7 +263,11 @@ def run_pipeline(video_path: str, output_dir: str = None):
             "scene": scene_label,
             "active_row": active_row,
             "stage": "OCR Recognition & Temporal Fusion",
+            "hw_mode": hw_mode,
         })
+        # Also print progress to terminal every 10 scoreboard frames
+        if scoreboard_seen % 10 == 1:
+            print(f"[ScoreVision] [{hw_mode}] Frame {frame_idx}/{total_frames} ({ts:.1f}s) | Scene: {scene_label} | Row: {active_row}", flush=True)
 
         raw_strings = ocr_all_valid_cells(valid_cells, timestamp_sec=ts)
 
@@ -237,9 +284,14 @@ def run_pipeline(video_path: str, output_dir: str = None):
 
         # Save keyframe image for live preview and timeline explorer
         try:
+            keyframe_p = os.path.join(keyframe_dir, f"frame_{frame_idx}.jpg")
+            cv2.imwrite(keyframe_p, ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+            # Atomic write: write to temp then rename so Streamlit never sees a half-written file
             preview_save_p = os.path.join(output_dir, "debug", "live_preview.jpg")
-            cv2.imwrite(preview_save_p, ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            cv2.imwrite(os.path.join(keyframe_dir, f"frame_{frame_idx}.jpg"), ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            preview_tmp_p  = preview_save_p + ".tmp"
+            cv2.imwrite(preview_tmp_p, ann_v_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            os.replace(preview_tmp_p, preview_save_p)
         except Exception:
             pass
 
@@ -268,6 +320,23 @@ def run_pipeline(video_path: str, output_dir: str = None):
     cap.release()
     if video_writer is not None:
         video_writer.release()
+        # Fast web H.264 encode for flawless browser playback without getting stuck
+        try:
+            import imageio_ffmpeg, subprocess
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            tmp_h264 = video_out_path + ".h264.mp4"
+            cmd = [
+                ffmpeg_exe, "-y", "-i", video_out_path,
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-preset", "ultrafast",
+                tmp_h264
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            if os.path.exists(tmp_h264) and os.path.getsize(tmp_h264) > 1024:
+                os.replace(tmp_h264, video_out_path)
+        except Exception as e:
+            pass
 
     # Finalize state
     final_state = tracker.committed
@@ -317,12 +386,15 @@ def run_pipeline(video_path: str, output_dir: str = None):
                     "unlabeled_metric": unlabeled_metric or "",
                 })
 
+    print(f"[ScoreVision] [{hw_mode}] Extraction complete — {scoreboard_seen} scoreboard frames | {cutaway_seen} cutaways", flush=True)
     emit({
         "type": "done",
         "scoreboard": scoreboard_seen,
         "cutaway": cutaway_seen,
         "final_state": final_annotated,
         "stage": "Export (JSON / CSV / MP4)",
+        "hw_mode": hw_mode,
+        "hw_label": hw_label,
     })
 
 
