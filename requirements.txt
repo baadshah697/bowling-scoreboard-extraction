@@ -1,15 +1,20 @@
-# Core Computer Vision & OCR
+# Core Computer Vision & Neural OCR
 opencv-python>=4.8.0
 numpy>=1.24.0
 torch>=2.0.0
+torchvision>=0.15.0
 easyocr>=1.7.0
 
-# Data Manipulation & Export
+# Video Transcoding & Web Playback
+imageio-ffmpeg>=0.4.9
+
+# Data Processing & Spreadsheet Exports
 pandas>=2.0.0
 openpyxl>=3.1.0
 
-# Automated Testing
+# Interactive Command Center Dashboard
+streamlit>=1.30.0
+
+# Quality Assurance & Rule Validation Testing
 pytest>=7.0.0
 
-# Web Application & Dashboard
-streamlit>=1.30.0
